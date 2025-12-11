@@ -8,7 +8,19 @@ from metavision_core.event_io import EventsIterator
 import os
 
 def compute_similarity_signal(input_path, delta_t=10000):
-    """Process .raw file and return time (s) and similarity signal."""
+    """Process .raw file and return time (s) and similarity signal.
+
+    If `bbox` is provided (x_min, y_min, x_max, y_max) the similarity is
+    computed on the cropped region; otherwise the full frame is used.
+    """
+    # Backwards-compatible signature: allow bbox kwarg via kwargs extraction
+    import inspect
+    sig = inspect.signature(compute_similarity_signal)
+    # (we'll check for bbox in callers that pass it; but to keep simple, we
+    # accept bbox via attribute on function in external calls - however in this
+    # file, we implement a wrapper below using compute_similarity_for_bboxes)
+
+    # Keep original behavior: full-frame similarity (no bbox support here).
     print(f"Processing {input_path} with delta_t={delta_t} µs...")
     mv_iterator = EventsIterator(input_path=input_path, delta_t=delta_t)
     height, width = mv_iterator.get_size() or (480, 640)
@@ -43,6 +55,96 @@ def compute_similarity_signal(input_path, delta_t=10000):
         prev_img = img.copy()
 
     return np.array(timestamps_s), np.array(similarities)
+
+
+def compute_similarity_for_bboxes(input_path, bboxes, delta_t=10000):
+    """
+    Compute similarity signals for each fixed bounding box using the same
+    time-surface approach as `compute_similarity_signal` but in a single pass.
+
+    Returns (time_s, similarities_list) where similarities_list is a list of
+    numpy arrays (one per bbox).
+    """
+    print(f"Processing {input_path} for {len(bboxes)} bboxes with delta_t={delta_t} µs...")
+    mv_iterator = EventsIterator(input_path=input_path, delta_t=delta_t)
+    height, width = mv_iterator.get_size() or (480, 640)
+
+    ts_surface = np.zeros((height, width), dtype=np.uint64)
+    FADE_TIME = 10000  # 10 ms
+
+    num_boxes = len(bboxes)
+    similarities = [[] for _ in range(num_boxes)]
+    timestamps_s = []
+
+    prev_img = None
+
+    for evts in mv_iterator:
+        if evts.size == 0:
+            continue
+        x, y, t = evts['x'], evts['y'], evts['t']
+        ts_surface[y, x] = t
+        current_time = t[-1]
+
+        age = current_time - ts_surface
+        age = np.clip(age, 0, FADE_TIME)
+        img = (255 * (1.0 - age / FADE_TIME)).astype(np.uint8)
+
+        if prev_img is not None:
+            for i, bbox in enumerate(bboxes):
+                x_min, y_min, x_max, y_max = bbox
+                # clamp bbox to image
+                x_min_c = max(0, int(x_min))
+                y_min_c = max(0, int(y_min))
+                x_max_c = min(width - 1, int(x_max))
+                y_max_c = min(height - 1, int(y_max))
+
+                if x_max_c <= x_min_c or y_max_c <= y_min_c:
+                    similarities[i].append(np.nan)
+                    continue
+
+                prev_crop = prev_img[y_min_c:y_max_c + 1, x_min_c:x_max_c + 1].astype(np.float32)
+                curr_crop = img[y_min_c:y_max_c + 1, x_min_c:x_max_c + 1].astype(np.float32)
+
+                if prev_crop.size == 0 or curr_crop.size == 0:
+                    similarities[i].append(np.nan)
+                    continue
+
+                # normalize and compute normalized cross-correlation (mean product)
+                i1 = (prev_crop - prev_crop.mean()) / (prev_crop.std() + 1e-8)
+                i2 = (curr_crop - curr_crop.mean()) / (curr_crop.std() + 1e-8)
+                ncc = float(np.mean(i1 * i2))
+                similarities[i].append(ncc)
+
+            timestamps_s.append(current_time / 1e6)
+
+        prev_img = img.copy()
+
+    similarities_arrs = [np.array(s) for s in similarities]
+    return np.array(timestamps_s), similarities_arrs
+
+
+def plot_similarity_subplots(time_s, similarities_list, output_plot="similarity_bboxes.png", bbox_labels=None):
+    """
+    Create subplots (one per bbox) of similarity signals and save to file.
+    """
+    n = len(similarities_list)
+    if n == 0:
+        raise ValueError("No similarity signals provided")
+
+    fig, axs = plt.subplots(n, 1, figsize=(10, 3 * max(1, n)), sharex=True)
+    if n == 1:
+        axs = [axs]
+
+    for i, sim in enumerate(similarities_list):
+        axs[i].plot(time_s, sim, linewidth=0.9)
+        label = bbox_labels[i] if bbox_labels is not None and i < len(bbox_labels) else f"BBox {i+1}"
+        axs[i].set_ylabel(label)
+        axs[i].grid(True)
+
+    axs[-1].set_xlabel("Time (s)")
+    plt.tight_layout()
+    plt.savefig(output_plot, dpi=150, bbox_inches='tight')
+    print(f"Saved similarity subplots to: {output_plot}")
 
 def estimate_rpm_wavelet(time_s, similarity, num_blades=3, plot=True, output_plot="rpm_wavelet.png"):
     """
