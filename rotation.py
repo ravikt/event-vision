@@ -162,7 +162,8 @@ def estimate_rpm_wavelet(time_s, similarity, num_blades=3, plot=True, output_plo
     fs = 1.0 / dt  # Hz
 
     # Define frequency range (e.g., 0.5 Hz to 20 Hz → 30 to 1200 RPM)
-    freqs = np.linspace(0.2, 30.0, 100)  # adjust based on expected RPM
+    # freqs = np.linspace(0.5, 200.0, 500)  # adjust based on expected RPM
+    freqs = np.logspace(np.log10(50), np.log10(250), 500) # log scale for better resolution at higher freqs
     scales = pywt.frequency2scale('morl', freqs) / dt  # morlet wavelet
 
     # Compute CWT
